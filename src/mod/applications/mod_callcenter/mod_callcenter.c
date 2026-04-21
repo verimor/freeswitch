@@ -2267,6 +2267,12 @@ struct agent_callback {
 	switch_bool_t skip_agents_with_external_calls;
 	cc_agent_status_t agent_no_answer_status;
 
+	/* agents_callback bu member icin bir outbound bridge thread'i spawn
+	 * ettiyse TRUE olur. Dispatch thread ayni turda ayni kuyrukta yuksek
+	 * score'lu member dispatch edilemediyse alt score'lulari atlamak icin
+	 * bu bayragi kullanir. */
+	switch_bool_t dispatched;
+
 	int tier;
 	int tier_agent_available;
 };
@@ -2374,36 +2380,23 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 
 		switch_safe_free(sql);
 	} else {
-		/* Map the Agent to the highest-score WAITING member in the same queue (FIFO fairness) */
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Callcenter: score-based dispatch attempting agent=%s queue=%s callback_member=%s\n",
-				agent_name, cbt->queue_name, cbt->member_uuid);
+		/* Map the Agent to the member */
 		sql = switch_mprintf("UPDATE members SET serving_agent = '%q', serving_system = '%q', state = '%q'"
-				" WHERE state = '%q' AND instance_id = '%q' AND queue = '%q'"
-				" AND uuid = (SELECT uuid FROM members"
-				"   WHERE state = '%q' AND instance_id = '%q' AND queue = '%q'"
-				"   ORDER BY (%" SWITCH_TIME_T_FMT " - joined_epoch) + base_score + skill_score DESC LIMIT 1)",
+				" WHERE state = '%q' AND uuid = '%q' AND instance_id = '%q'",
 				agent_name, agent_system, cc_member_state2str(CC_MEMBER_STATE_TRYING),
-				cc_member_state2str(CC_MEMBER_STATE_WAITING), globals.cc_instance_id, cbt->queue_name,
-				cc_member_state2str(CC_MEMBER_STATE_WAITING), globals.cc_instance_id, cbt->queue_name,
-				local_epoch_time_now(NULL));
+				cc_member_state2str(CC_MEMBER_STATE_WAITING), cbt->member_uuid, globals.cc_instance_id);
 		cc_execute_sql(NULL, sql, NULL);
 		switch_safe_free(sql);
 
-		/* Check if we won the race to get a member to our selected agent (Used for Multi system purposes) */
-		sql = switch_mprintf("SELECT count(*) FROM members WHERE serving_agent = '%q' AND serving_system = '%q'"
-				" AND queue = '%q' AND instance_id = '%q' AND state = '%q'",
-				agent_name, agent_system, cbt->queue_name, globals.cc_instance_id,
-				cc_member_state2str(CC_MEMBER_STATE_TRYING));
+		/* Check if we won the race to get the member to our selected agent (Used for Multi system purposes) */
+		sql = switch_mprintf("SELECT count(*) FROM members WHERE serving_agent = '%q' AND serving_system = '%q' AND uuid = '%q' AND instance_id = '%q'",
+				agent_name, agent_system, cbt->member_uuid, globals.cc_instance_id);
 		cc_execute_sql2str(NULL, NULL, sql, res, sizeof(res));
 		switch_safe_free(sql);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Callcenter: score-based dispatch race check agent=%s queue=%s result=%s\n",
-				agent_name, cbt->queue_name, res);
 	}
 
 	switch (atoi(res)) {
 		case 0: /* Ok, someone else took it, or user hanged up already */
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Callcenter: score-based dispatch lost race or member gone agent=%s queue=%s\n",
-					agent_name, cbt->queue_name);
 			return 1;
 			/* We default to default even if more entry is returned... Should never happen	anyway */
 		default: /* Go ahead, start thread to try to bridge these 2 caller */
@@ -2413,70 +2406,11 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				switch_memory_pool_t *pool;
 				struct call_helper *h;
 
-				/* Fetch the actual member that was assigned (may differ from cbt->member_* due to score-based selection) */
-				char assigned_member_uuid[256] = "";
-				char assigned_member_session_uuid[256] = "";
-				char assigned_member_cid_name[256] = "";
-				char assigned_member_cid_number[256] = "";
-				char assigned_member_joined_epoch[64] = "";
-
-				if (!strcasecmp(cbt->strategy, "ring-all") || !strcasecmp(cbt->strategy, "ring-progressively")) {
-					/* ring-all / ring-progressively: member identity comes from dispatcher callback as before */
-					switch_snprintf(assigned_member_uuid, sizeof(assigned_member_uuid), "%s", cbt->member_uuid);
-					switch_snprintf(assigned_member_session_uuid, sizeof(assigned_member_session_uuid), "%s", cbt->member_session_uuid);
-					switch_snprintf(assigned_member_cid_name, sizeof(assigned_member_cid_name), "%s", cbt->member_cid_name);
-					switch_snprintf(assigned_member_cid_number, sizeof(assigned_member_cid_number), "%s", cbt->member_cid_number);
-					switch_snprintf(assigned_member_joined_epoch, sizeof(assigned_member_joined_epoch), "%s", cbt->member_joined_epoch);
-				} else {
-					/* Other strategies: look up the member that was actually assigned to this agent (single query) */
-					sql = switch_mprintf("SELECT COALESCE(uuid,'') || '|' || COALESCE(session_uuid,'') || '|' || COALESCE(cid_name,'') || '|' || COALESCE(cid_number,'') || '|' || CAST(joined_epoch AS VARCHAR)"
-							" FROM members WHERE serving_agent = '%q' AND serving_system = '%q'"
-							" AND queue = '%q' AND instance_id = '%q' AND state = '%q' LIMIT 1",
-							agent_name, agent_system, cbt->queue_name, globals.cc_instance_id,
-							cc_member_state2str(CC_MEMBER_STATE_TRYING));
-					{
-						char compound_res[1024] = "";
-						cc_execute_sql2str(NULL, NULL, sql, compound_res, sizeof(compound_res));
-						switch_safe_free(sql);
-
-						if (!zstr(compound_res)) {
-							char *fields[5] = {NULL};
-							int fi = 0;
-							char *p = compound_res;
-							char *sep;
-
-							fields[fi++] = p;
-							while (fi < 5 && (sep = strchr(p, '|'))) {
-								*sep = '\0';
-								p = sep + 1;
-								fields[fi++] = p;
-							}
-
-							if (fields[0])
-								switch_snprintf(assigned_member_uuid, sizeof(assigned_member_uuid), "%s", fields[0]);
-							if (fields[1])
-								switch_snprintf(assigned_member_session_uuid, sizeof(assigned_member_session_uuid), "%s", fields[1]);
-							if (fields[2])
-								switch_snprintf(assigned_member_cid_name, sizeof(assigned_member_cid_name), "%s", fields[2]);
-							if (fields[3])
-								switch_snprintf(assigned_member_cid_number, sizeof(assigned_member_cid_number), "%s", fields[3]);
-							if (fields[4])
-								switch_snprintf(assigned_member_joined_epoch, sizeof(assigned_member_joined_epoch), "%s", fields[4]);
-
-							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Callcenter: score-based dispatch resolved assigned_member=%s session=%s cid_name=%s cid_number=%s joined=%s agent=%s queue=%s\n",
-									assigned_member_uuid, assigned_member_session_uuid, assigned_member_cid_name, assigned_member_cid_number, assigned_member_joined_epoch, agent_name, cbt->queue_name);
-						} else {
-							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Callcenter: score-based dispatch could not resolve assigned member for agent=%s queue=%s\n",
-									agent_name, cbt->queue_name);
-						}
-					}
-				}
-
 				switch_core_new_memory_pool(&pool);
 				h = switch_core_alloc(pool, sizeof(*h));
 				h->pool = pool;
-				h->member_uuid = switch_core_strdup(h->pool, assigned_member_uuid);
-				h->member_session_uuid = switch_core_strdup(h->pool, assigned_member_session_uuid);
+				h->member_uuid = switch_core_strdup(h->pool, cbt->member_uuid);
+				h->member_session_uuid = switch_core_strdup(h->pool, cbt->member_session_uuid);
 				h->queue_strategy = switch_core_strdup(h->pool, cbt->strategy);
 				h->originate_string = switch_core_strdup(h->pool, agent_originate_string);
 				h->agent_name = switch_core_strdup(h->pool, agent_name);
@@ -2484,9 +2418,9 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				h->agent_status = switch_core_strdup(h->pool, agent_status);
 				h->agent_type = switch_core_strdup(h->pool, agent_type);
 				h->agent_uuid = switch_core_strdup(h->pool, agent_uuid);
-				h->member_joined_epoch = switch_core_strdup(h->pool, assigned_member_joined_epoch);
-				h->member_cid_name = switch_core_strdup(h->pool, assigned_member_cid_name);
-				h->member_cid_number = switch_core_strdup(h->pool, assigned_member_cid_number);
+				h->member_joined_epoch = switch_core_strdup(h->pool, cbt->member_joined_epoch);
+				h->member_cid_name = switch_core_strdup(h->pool, cbt->member_cid_name);
+				h->member_cid_number = switch_core_strdup(h->pool, cbt->member_cid_number);
 				h->queue_name = switch_core_strdup(h->pool, cbt->queue_name);
 				h->record_template = switch_core_strdup(h->pool, cbt->record_template);
 				h->no_answer_count = atoi(agent_no_answer_count);
@@ -2497,7 +2431,7 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				h->agent_no_answer_status = cbt->agent_no_answer_status;
 
 				if (!strcasecmp(cbt->strategy, "ring-progressively")) {
-					switch_core_session_t *member_session = switch_core_session_locate(assigned_member_session_uuid);
+					switch_core_session_t *member_session = switch_core_session_locate(cbt->member_session_uuid);
 					if (member_session) {
 						switch_channel_t *member_channel = switch_core_session_get_channel(member_session);
 						switch_channel_set_variable_printf(member_channel, "cc_last_originated_call", "%" SWITCH_TIME_T_FMT, local_epoch_time_now(NULL));
@@ -2506,7 +2440,7 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				}
 
 				if (!strcasecmp(cbt->strategy, "top-down")) {
-					switch_core_session_t *member_session = switch_core_session_locate(assigned_member_session_uuid);
+					switch_core_session_t *member_session = switch_core_session_locate(cbt->member_session_uuid);
 					if (member_session) {
 						switch_channel_t *member_channel = switch_core_session_get_channel(member_session);
 						switch_channel_set_variable(member_channel, "cc_last_agent_tier_position", agent_tier_position);
@@ -2528,6 +2462,8 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				switch_threadattr_detach_set(thd_attr, 1);
 				switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
 				switch_thread_create(&thread, thd_attr, outbound_agent_thread_run, h, h->pool);
+
+				cbt->dispatched = SWITCH_TRUE;
 			}
 
 			if (!strcasecmp(cbt->strategy,"ring-all")) {
@@ -2542,6 +2478,11 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 
 static int members_callback(void *pArg, int argc, char **argv, char **columnNames)
 {
+	/* Tur bazli bloklu kuyruklar hash'i (dispatch thread tarafindan acilir ve
+	 * kapatilir). Ayni turda ayni kuyrukta yuksek score'lu bir Waiting member
+	 * agent bulamadiysa, kuyruk burada isaretlidir ve alt score'lu Waiting
+	 * member'lar atlanir. */
+	switch_hash_t *blocked_queues = (switch_hash_t *) pArg;
 	cc_queue_t *queue = NULL;
 	char *sql = NULL;
 	char *sql_order_by = NULL;
@@ -2558,8 +2499,8 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 	const char *member_state = NULL;
 	const char *member_abandoned_epoch = NULL;
 	const char *serving_agent = NULL;
-	const char *serving_system = NULL;
 	const char *last_originated_call = NULL;
+	switch_bool_t is_waiting_state = SWITCH_FALSE;
 	memset(&cbt, 0, sizeof(cbt));
 
 	cbt.queue_name = argv[0];
@@ -2572,8 +2513,16 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 	member_state = argv[7];
 	member_abandoned_epoch = argv[8];
 	serving_agent = argv[9];
-	serving_system = argv[10];
-	cbt.member_system = argv[11];
+	cbt.member_system = argv[10];
+
+	is_waiting_state = (member_state && !strcasecmp(member_state, cc_member_state2str(CC_MEMBER_STATE_WAITING)));
+
+	/* Strict score onceligi: bu tur ayni kuyrukta daha yuksek score'lu Waiting
+	 * member agent bulamadiysa, bu (daha dusuk score'lu) member'i atla. */
+	if (is_waiting_state && blocked_queues && cbt.queue_name &&
+			switch_core_hash_find(blocked_queues, cbt.queue_name)) {
+		goto end;
+	}
 
 	if (!cbt.queue_name || !(queue = get_queue(cbt.queue_name))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Queue %s not found locally, delete this member\n", cbt.queue_name);
@@ -2617,121 +2566,6 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 		}
 		/* Skip this member */
 		goto end;
-	}
-
-	/*
-	 * If a member is stuck in TRYING (non ring-all / ring-progressively) and the mapped agent is no longer in a
-	 * state where it can complete the offer, this member would otherwise be skipped forever by the dispatcher.
-	 * Reset it back to WAITING so it can be served in FIFO order again.
-	 *
-	 * State-based checks (status, tier, receiving) are only applied once the offer has been outstanding
-	 * for at least agent_originate_timeout seconds, to avoid false resets caused by state-transition
-	 * race conditions (e.g. the agent has not yet moved from Waiting to Receiving).
-	 */
-	if (!strcasecmp(member_state, cc_member_state2str(CC_MEMBER_STATE_TRYING)) &&
-			!zstr(serving_agent) &&
-			strcasecmp(serving_agent, "ring-all") &&
-			strcasecmp(serving_agent, "ring-progressively")) {
-		char agent_state_res[128] = "";
-		char agent_status_res[128] = "";
-		char agent_last_offered_call_res[64] = "";
-		char tier_state_res[128] = "";
-		const char *agent_instance_id = !zstr(serving_system) ? serving_system : globals.cc_instance_id;
-		switch_time_t now_epoch = local_epoch_time_now(NULL);
-		char *agent_sql = NULL;
-		switch_bool_t reset_trying = SWITCH_FALSE;
-		const char *reset_reason = NULL;
-
-		agent_sql = switch_mprintf("SELECT state FROM agents WHERE name = '%q' AND instance_id = '%q' LIMIT 1", serving_agent, agent_instance_id);
-		cc_execute_sql2str(NULL, NULL, agent_sql, agent_state_res, sizeof(agent_state_res));
-		switch_safe_free(agent_sql);
-
-		agent_sql = switch_mprintf("SELECT status FROM agents WHERE name = '%q' AND instance_id = '%q' LIMIT 1", serving_agent, agent_instance_id);
-		cc_execute_sql2str(NULL, NULL, agent_sql, agent_status_res, sizeof(agent_status_res));
-		switch_safe_free(agent_sql);
-
-		agent_sql = switch_mprintf("SELECT last_offered_call FROM agents WHERE name = '%q' AND instance_id = '%q' LIMIT 1", serving_agent, agent_instance_id);
-		cc_execute_sql2str(NULL, NULL, agent_sql, agent_last_offered_call_res, sizeof(agent_last_offered_call_res));
-		switch_safe_free(agent_sql);
-
-		agent_sql = switch_mprintf("SELECT state FROM tiers WHERE agent = '%q' AND queue = '%q' LIMIT 1", serving_agent, cbt.queue_name);
-		cc_execute_sql2str(NULL, NULL, agent_sql, tier_state_res, sizeof(tier_state_res));
-		switch_safe_free(agent_sql);
-
-		{
-			switch_time_t offered_epoch = !zstr(agent_last_offered_call_res) ? (switch_time_t)atoll(agent_last_offered_call_res) : 0;
-			switch_time_t offered_age = (offered_epoch > 0) ? (now_epoch - offered_epoch) : (switch_time_t)-1;
-			/* Only apply state-based checks once the offer is mature enough to rule out race conditions */
-			switch_bool_t offer_mature = (offered_epoch > 0 && offered_age >= globals.agent_originate_timeout);
-
-			/* Agent missing: reset immediately regardless of offer age */
-			if (zstr(agent_state_res) || zstr(agent_status_res)) {
-				reset_trying = SWITCH_TRUE;
-				reset_reason = "agent-missing";
-			}
-
-			/* Remaining checks require the offer to be at least originate_timeout old */
-			if (reset_trying == SWITCH_FALSE && offer_mature) {
-				if (strcasecmp(agent_status_res, cc_agent_status2str(CC_AGENT_STATUS_AVAILABLE)) &&
-						strcasecmp(agent_status_res, cc_agent_status2str(CC_AGENT_STATUS_AVAILABLE_ON_DEMAND))) {
-					reset_trying = SWITCH_TRUE;
-					reset_reason = "agent-status-not-available";
-				}
-			}
-
-			/* Tier must be in a state compatible with offering */
-			if (reset_trying == SWITCH_FALSE && offer_mature) {
-				if (zstr(tier_state_res) ||
-						(strcasecmp(tier_state_res, cc_tier_state2str(CC_TIER_STATE_READY)) &&
-						 strcasecmp(tier_state_res, cc_tier_state2str(CC_TIER_STATE_NO_ANSWER)) &&
-						 strcasecmp(tier_state_res, cc_tier_state2str(CC_TIER_STATE_OFFERING)))) {
-					reset_trying = SWITCH_TRUE;
-					reset_reason = "tier-state-not-eligible";
-				}
-			}
-
-			/* Agent must still be in offer-receiving state */
-			if (reset_trying == SWITCH_FALSE && offer_mature) {
-				if (strcasecmp(agent_state_res, cc_agent_state2str(CC_AGENT_STATE_RECEIVING)) &&
-						strcasecmp(agent_state_res, cc_agent_state2str(CC_AGENT_STATE_RESERVED))) {
-					reset_trying = SWITCH_TRUE;
-					reset_reason = "agent-state-not-receiving";
-				}
-			}
-
-			/*
-			 * Catch-all: if the offer has been outstanding longer than originate_timeout + 10 seconds,
-			 * treat it as stale and put the member back to WAITING regardless of state.
-			 */
-			if (reset_trying == SWITCH_FALSE && offered_epoch > 0 && offered_age > (globals.agent_originate_timeout + 10)) {
-				reset_trying = SWITCH_TRUE;
-				reset_reason = "stale-offer-timeout";
-			}
-
-			if (reset_trying == SWITCH_TRUE) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-						"Callcenter: reset stuck TRYING member session_uuid=%s cid_number=%s queue=%s joined_epoch=%s serving_agent=%s serving_system=%s agent_status=%s agent_state=%s tier_state=%s last_offered_call=%s offered_age=%" SWITCH_TIME_T_FMT " originate_timeout=%d reason=%s\n",
-						cbt.member_session_uuid, cbt.member_cid_number, cbt.queue_name, cbt.member_joined_epoch,
-						serving_agent, !zstr(serving_system) ? serving_system : "",
-						!zstr(agent_status_res) ? agent_status_res : "",
-						!zstr(agent_state_res) ? agent_state_res : "",
-						!zstr(tier_state_res) ? tier_state_res : "",
-						!zstr(agent_last_offered_call_res) ? agent_last_offered_call_res : "",
-						offered_age, globals.agent_originate_timeout,
-						reset_reason ? reset_reason : "unknown");
-
-				sql = switch_mprintf("UPDATE members SET state = '%q', serving_agent = '', serving_system = ''"
-						" WHERE uuid = '%q' AND instance_id = '%q' AND state = '%q'",
-						cc_member_state2str(CC_MEMBER_STATE_WAITING),
-						cbt.member_uuid, cbt.member_system,
-						cc_member_state2str(CC_MEMBER_STATE_TRYING));
-				cc_execute_sql(NULL, sql, NULL);
-				switch_safe_free(sql);
-				member_state = cc_member_state2str(CC_MEMBER_STATE_WAITING);
-				serving_agent = "";
-				serving_system = "";
-			}
-		}
 	}
 
 	/* Tracking queue strategy changes */
@@ -2912,6 +2746,12 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 
 	switch_safe_free(sql);
 
+	/* Dispatch edilemediyse kuyrugu bu tur icin blokla; alt score'lular atlansin. */
+	if (is_waiting_state && blocked_queues && cbt.queue_name && !cbt.dispatched
+			&& !switch_core_hash_find(blocked_queues, cbt.queue_name)) {
+		switch_core_hash_insert(blocked_queues, cbt.queue_name, (void *) 1);
+	}
+
 	/* We update a field in the queue struct so we can kick caller out if waiting for too long with no agent */
 	if (!cbt.queue_name || !(queue = get_queue(cbt.queue_name))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Queue %s not found locally, skip this member\n", cbt.queue_name);
@@ -2967,18 +2807,44 @@ void *SWITCH_THREAD_FUNC cc_agent_dispatch_thread_run(switch_thread_t *thread, v
 
 	while (globals.running == 1) {
 		char *sql = NULL;
-		sql = switch_mprintf("SELECT queue,uuid,session_uuid,cid_number,cid_name,joined_epoch,(%" SWITCH_TIME_T_FMT "-joined_epoch)+base_score+skill_score AS score, state, abandoned_epoch, serving_agent, serving_system, instance_id FROM members"
-				" WHERE (state = '%q' OR state = '%q' OR state = '%q' OR (serving_agent = 'ring-all' AND state = '%q') OR (serving_agent = 'ring-progressively' AND state = '%q')) AND instance_id = '%q' ORDER BY score DESC",
-				local_epoch_time_now(NULL),
+		switch_time_t now = local_epoch_time_now(NULL);
+		switch_hash_t *blocked_queues = NULL;
+
+		/*
+		 * Kuyruk-bazli strict oncelik + paralel dispatch.
+		 *
+		 * SELECT tum adaylari score DESC siralar. members_callback ayni
+		 * turda ayni kuyrukta *yuksek score'lu* bir Waiting member agent
+		 * bulamadiysa blocked_queues hash'ine kuyrugu ekler; sonraki gelen
+		 * dusuk score'lular o turda atlanir. Bu sayede:
+		 *   - Normal durum: kuyrukta bos N agent varsa N dispatch paralel
+		 *     olarak tek turda yapilir.
+		 *   - Yaris penceresi yok: en ust member bos agent bulamadiysa,
+		 *     turun ortasinda bosalan agent alt score'lu member'a gitmez;
+		 *     bir sonraki turda tekrar en yuksek score'lu member ilk
+		 *     sansi alir.
+		 */
+		switch_core_hash_init(&blocked_queues);
+
+		sql = switch_mprintf(
+				"SELECT queue,uuid,session_uuid,cid_number,cid_name,joined_epoch,"
+				"(%" SWITCH_TIME_T_FMT "-joined_epoch)+base_score+skill_score AS score,"
+				" state, abandoned_epoch, serving_agent, instance_id FROM members"
+				" WHERE (state = '%q' OR state = '%q'"
+				"        OR (serving_agent = 'ring-all' AND state = '%q')"
+				"        OR (serving_agent = 'ring-progressively' AND state = '%q'))"
+				"   AND instance_id = '%q'"
+				" ORDER BY score DESC",
+				now,
 				cc_member_state2str(CC_MEMBER_STATE_WAITING),
 				cc_member_state2str(CC_MEMBER_STATE_ABANDONED),
 				cc_member_state2str(CC_MEMBER_STATE_TRYING),
 				cc_member_state2str(CC_MEMBER_STATE_TRYING),
-				cc_member_state2str(CC_MEMBER_STATE_TRYING),
 				globals.cc_instance_id);
 
-		cc_execute_sql_callback(NULL /* queue */, NULL /* mutex */, sql, members_callback, NULL /* Call back variables */);
+		cc_execute_sql_callback(NULL /* queue */, NULL /* mutex */, sql, members_callback, blocked_queues);
 		switch_safe_free(sql);
+		switch_core_hash_destroy(&blocked_queues);
 		switch_yield(100000);
 	}
 

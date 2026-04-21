@@ -7,6 +7,6 @@
     "editor.formatOnType": false, // Disables formatting while typing
     "editor.formatOnPaste": false, // Disables formatting when pasting code
     "editor.codeActionsOnSave": {
-        "source.fixAll": false // Disables all auto-fixes on save
+        "source.fixAll": "never"
     }
 }

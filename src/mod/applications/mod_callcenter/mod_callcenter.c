@@ -2267,10 +2267,39 @@ struct agent_callback {
 	switch_bool_t skip_agents_with_external_calls;
 	cc_agent_status_t agent_no_answer_status;
 
+	/* agents_callback bu member icin bir outbound bridge thread'i spawn
+	 * ettiyse TRUE olur. Dispatch thread ayni turda ayni kuyrukta yuksek
+	 * score'lu member dispatch edilemediyse alt score'lulari atlamak icin
+	 * bu bayragi kullanir. */
+	switch_bool_t dispatched;
+
 	int tier;
 	int tier_agent_available;
+
+	/* Geri donuk inceleme icin diagnostic alanlar (sadece logging amacli). */
+	switch_time_t tick_id;       /* dispatch tur numarasi */
+	int agents_total_rows;       /* SQL'den donen agent satir sayisi */
+	int agents_skipped_tier;     /* tier kurallari sebebiyle elenen */
+	int agents_skipped_state;    /* state/wrap_up/ready_time/external sebebiyle elenen */
+	int agents_skipped_other_box;/* baska sunucudaki agent (single_box degil) */
+	int agents_reserve_failed;   /* reserve_agents=true iken state_if_waiting basarisiz */
+	int agents_lost_race;        /* count check'ten 0 dondu (baska tarafa gitti) */
 };
 typedef struct agent_callback agent_callback_t;
+
+/* Dispatch tick context: members_callback'e pArg olarak gecirilir.
+ * Hem strict score onceligi (blocked_queues) hem de geri donuk loglama
+ * icin gerekli butun bilgileri tasir. */
+struct dispatch_tick_ctx {
+	switch_hash_t *blocked_queues;
+	switch_time_t tick_id;
+	int members_seen;            /* members_callback'e giren satir sayisi */
+	int members_skipped_blocked; /* baslangictan blocked queue sebebiyle atlanan */
+	int members_dispatched;      /* outbound thread spawn edilen */
+	int members_no_agent;        /* Waiting ama agent bulunmayan */
+	int members_abandoned;       /* Abandoned cleanup yolu */
+};
+typedef struct dispatch_tick_ctx dispatch_tick_ctx_t;
 
 static int agents_callback(void *pArg, int argc, char **argv, char **columnNames)
 {
@@ -2298,8 +2327,13 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 	const char *agent_external_calls_count = argv[18];
 
 	switch_bool_t contact_agent = SWITCH_TRUE;
+	const char *skip_reason = NULL;
+	long now_epoch = (long) local_epoch_time_now(NULL);
+	long idle_seconds = now_epoch - atol(agent_last_bridge_end);
+	long ready_in = atol(agent_ready_time) - now_epoch;
 
 	cbt->agent_found = SWITCH_TRUE;
+	cbt->agents_total_rows++;
 
 	/* Check if we switch to a different tier, if so, check if we should continue further for that member */
 
@@ -2317,6 +2351,12 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 			cbt->tier_agent_available = 0;
 		} else {
 			/* We are not allowed to continue to the next tier of agent */
+			cbt->agents_skipped_tier++;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+				"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_SKIP session=%s queue=%s member=%s score=%s agent=%s reason=tier_rules level=%s position=%s\n",
+				cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+				cbt->queue_name ? cbt->queue_name : "?", cbt->member_uuid ? cbt->member_uuid : "?",
+				cbt->member_score ? cbt->member_score : "?", agent_name, agent_tier_level, agent_tier_position);
 			return 1;
 		}
 	}
@@ -2325,29 +2365,51 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 	/* If Agent is not in a acceptable tier state, continue */
 	if (! (!strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_NO_ANSWER)) || !strcasecmp(agent_tier_state, cc_tier_state2str(CC_TIER_STATE_READY)))) {
 		contact_agent = SWITCH_FALSE;
+		skip_reason = "tier_state";
 	}
 	if (! (!strcasecmp(agent_state, cc_agent_state2str(CC_AGENT_STATE_WAITING)))) {
 		contact_agent = SWITCH_FALSE;
+		if (!skip_reason) skip_reason = "agent_state_not_waiting";
 	}
 	if (! (atol(agent_last_bridge_end) < ((long) local_epoch_time_now(NULL) - atol(agent_wrap_up_time)))) {
 		contact_agent = SWITCH_FALSE;
+		if (!skip_reason) skip_reason = "wrap_up_active";
 	}
 	if (! (atol(agent_ready_time) <= (long) local_epoch_time_now(NULL))) {
 		contact_agent = SWITCH_FALSE;
+		if (!skip_reason) skip_reason = "ready_time_cooldown";
 	}
 	if (! (strcasecmp(agent_status, cc_agent_status2str(CC_AGENT_STATUS_ON_BREAK)))) {
 		contact_agent = SWITCH_FALSE;
+		if (!skip_reason) skip_reason = "on_break";
 	}
 	/* XXX callcenter_track app can update this counter after we selected this agent on database */
 	if (cbt->skip_agents_with_external_calls && atoi(agent_external_calls_count) > 0) {
 		contact_agent = SWITCH_FALSE;
+		if (!skip_reason) skip_reason = "external_calls_active";
 	}
 	if (contact_agent == SWITCH_FALSE) {
+		cbt->agents_skipped_state++;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+			"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_SKIP session=%s queue=%s member=%s score=%s agent=%s reason=%s "
+			"agent_state=%s tier_state=%s status=%s level=%s position=%s idle_s=%ld ready_in_s=%ld ext_calls=%s\n",
+			cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+			cbt->queue_name ? cbt->queue_name : "?", cbt->member_uuid ? cbt->member_uuid : "?",
+			cbt->member_score ? cbt->member_score : "?", agent_name, skip_reason ? skip_reason : "unknown",
+			agent_state, agent_tier_state, agent_status, agent_tier_level, agent_tier_position,
+			idle_seconds, ready_in, agent_external_calls_count);
 		return 0; /* Continue to next Agent */
 	}
 
 	/* If agent isn't on this box */
 	if (strcasecmp(agent_system,"single_box" /* SELF */)) {
+		cbt->agents_skipped_other_box++;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+			"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_SKIP session=%s queue=%s member=%s score=%s agent=%s reason=other_box system=%s strategy=%s\n",
+			cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+			cbt->queue_name ? cbt->queue_name : "?", cbt->member_uuid ? cbt->member_uuid : "?",
+			cbt->member_score ? cbt->member_score : "?", agent_name, agent_system,
+			cbt->strategy ? cbt->strategy : "?");
 		if (!strcasecmp(cbt->strategy, "ring-all")) {
 			return 1; /* Abort finding agent for member if we found a match but for a different Server */
 		} else {
@@ -2362,6 +2424,12 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Reserved Agent %s\n", agent_name);
 		} else {
 			/* Agent changed state just before we tried to update his state to Reserved. */
+			cbt->agents_reserve_failed++;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+				"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_SKIP session=%s queue=%s member=%s score=%s agent=%s reason=reserve_failed_race\n",
+				cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+				cbt->queue_name ? cbt->queue_name : "?", cbt->member_uuid ? cbt->member_uuid : "?",
+				cbt->member_score ? cbt->member_score : "?", agent_name);
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Failed to Reserve Agent: %s. Skipping...\n", agent_name);
 			return 0;
 		}
@@ -2391,6 +2459,13 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 
 	switch (atoi(res)) {
 		case 0: /* Ok, someone else took it, or user hanged up already */
+			cbt->agents_lost_race++;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+				"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_LOST_RACE session=%s queue=%s member=%s score=%s agent=%s strategy=%s "
+				"(member already taken by another dispatcher / system)\n",
+				cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+				cbt->queue_name ? cbt->queue_name : "?", cbt->member_uuid ? cbt->member_uuid : "?",
+				cbt->member_score ? cbt->member_score : "?", agent_name, cbt->strategy ? cbt->strategy : "?");
 			return 1;
 			/* We default to default even if more entry is returned... Should never happen	anyway */
 		default: /* Go ahead, start thread to try to bridge these 2 caller */
@@ -2456,6 +2531,18 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 				switch_threadattr_detach_set(thd_attr, 1);
 				switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
 				switch_thread_create(&thread, thd_attr, outbound_agent_thread_run, h, h->pool);
+
+				cbt->dispatched = SWITCH_TRUE;
+
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+					"[CCDSP] tick=%" SWITCH_TIME_T_FMT " AGENT_OFFER session=%s queue=%s strategy=%s member=%s score=%s waited_s=%ld "
+					"agent=%s level=%s position=%s idle_s=%ld ready_in_s=%ld no_answer=%s/%s status=%s type=%s\n",
+					cbt->tick_id, cbt->member_session_uuid ? cbt->member_session_uuid : "-",
+					cbt->queue_name ? cbt->queue_name : "?", cbt->strategy ? cbt->strategy : "?",
+					cbt->member_uuid ? cbt->member_uuid : "?", cbt->member_score ? cbt->member_score : "?",
+					(long) (now_epoch - atol(cbt->member_joined_epoch ? cbt->member_joined_epoch : "0")),
+					agent_name, agent_tier_level, agent_tier_position, idle_seconds, ready_in,
+					agent_no_answer_count, agent_max_no_answer, agent_status, agent_type);
 			}
 
 			if (!strcasecmp(cbt->strategy,"ring-all")) {
@@ -2470,6 +2557,11 @@ static int agents_callback(void *pArg, int argc, char **argv, char **columnNames
 
 static int members_callback(void *pArg, int argc, char **argv, char **columnNames)
 {
+	/* Dispatch tick context: hem strict score onceligi (blocked_queues hash) hem
+	 * de geri donuk diagnostic loglama icin tum bilgileri tasir. */
+	dispatch_tick_ctx_t *tctx = (dispatch_tick_ctx_t *) pArg;
+	switch_hash_t *blocked_queues = tctx ? tctx->blocked_queues : NULL;
+	switch_time_t tick_id = tctx ? tctx->tick_id : 0;
 	cc_queue_t *queue = NULL;
 	char *sql = NULL;
 	char *sql_order_by = NULL;
@@ -2487,6 +2579,8 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 	const char *member_abandoned_epoch = NULL;
 	const char *serving_agent = NULL;
 	const char *last_originated_call = NULL;
+	switch_bool_t is_waiting_state = SWITCH_FALSE;
+	long waited_seconds = 0;
 	memset(&cbt, 0, sizeof(cbt));
 
 	cbt.queue_name = argv[0];
@@ -2500,6 +2594,36 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 	member_abandoned_epoch = argv[8];
 	serving_agent = argv[9];
 	cbt.member_system = argv[10];
+	cbt.tick_id = tick_id;
+
+	is_waiting_state = (member_state && !strcasecmp(member_state, cc_member_state2str(CC_MEMBER_STATE_WAITING)));
+	waited_seconds = (long) local_epoch_time_now(NULL) - atol(cbt.member_joined_epoch ? cbt.member_joined_epoch : "0");
+
+	if (tctx) {
+		tctx->members_seen++;
+	}
+
+	/* Her member icin giris log'u: hangi turda, hangi member, kuyruk, score, durum, ne kadar bekledi */
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+		"[CCDSP] tick=%" SWITCH_TIME_T_FMT " MEMBER_ENTER session=%s queue=%s member=%s cid=%s state=%s score=%s waited_s=%ld serving_agent=%s\n",
+		tick_id, cbt.member_session_uuid ? cbt.member_session_uuid : "-",
+		cbt.queue_name ? cbt.queue_name : "?", cbt.member_uuid ? cbt.member_uuid : "?",
+		cbt.member_cid_number ? cbt.member_cid_number : "?", member_state ? member_state : "?",
+		cbt.member_score ? cbt.member_score : "?", waited_seconds, serving_agent ? serving_agent : "");
+
+	/* Strict score onceligi: bu tur ayni kuyrukta daha yuksek score'lu Waiting
+	 * member agent bulamadiysa, bu (daha dusuk score'lu) member'i atla. */
+	if (is_waiting_state && blocked_queues && cbt.queue_name &&
+			switch_core_hash_find(blocked_queues, cbt.queue_name)) {
+		if (tctx) tctx->members_skipped_blocked++;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+			"[CCDSP] tick=%" SWITCH_TIME_T_FMT " MEMBER_SKIP_LOCKED session=%s queue=%s member=%s score=%s waited_s=%ld "
+			"reason=queue_locked_by_higher_score_member_in_same_tick\n",
+			tick_id, cbt.member_session_uuid ? cbt.member_session_uuid : "-",
+			cbt.queue_name, cbt.member_uuid ? cbt.member_uuid : "?",
+			cbt.member_score ? cbt.member_score : "?", waited_seconds);
+		goto end;
+	}
 
 	if (!cbt.queue_name || !(queue = get_queue(cbt.queue_name))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Queue %s not found locally, delete this member\n", cbt.queue_name);
@@ -2532,6 +2656,7 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 	/* Checking for cleanup Abandonded calls from the db */
 	if (!strcasecmp(member_state, cc_member_state2str(CC_MEMBER_STATE_ABANDONED))) {
 		switch_time_t abandoned_epoch = atoll(member_abandoned_epoch);
+		switch_bool_t deleted = SWITCH_FALSE;
 		if (abandoned_epoch == 0) {
 			abandoned_epoch = atoll(cbt.member_joined_epoch);
 		}
@@ -2540,7 +2665,14 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 			sql = switch_mprintf("DELETE FROM members WHERE uuid = '%q' AND instance_id = '%q' AND (abandoned_epoch = '%" SWITCH_TIME_T_FMT "' OR joined_epoch = '%q')", cbt.member_uuid, cbt.member_system, abandoned_epoch, cbt.member_joined_epoch);
 			cc_execute_sql(NULL, sql, NULL);
 			switch_safe_free(sql);
+			deleted = SWITCH_TRUE;
 		}
+		if (tctx) tctx->members_abandoned++;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+			"[CCDSP] tick=%" SWITCH_TIME_T_FMT " MEMBER_ABANDONED_PATH session=%s queue=%s member=%s abandoned_epoch=%" SWITCH_TIME_T_FMT " discard_after=%u %s\n",
+			tick_id, cbt.member_session_uuid ? cbt.member_session_uuid : "-",
+			cbt.queue_name ? cbt.queue_name : "?", cbt.member_uuid ? cbt.member_uuid : "?",
+			abandoned_epoch, discard_abandoned_after, deleted ? "deleted" : "kept");
 		/* Skip this member */
 		goto end;
 	}
@@ -2723,6 +2855,38 @@ static int members_callback(void *pArg, int argc, char **argv, char **columnName
 
 	switch_safe_free(sql);
 
+	/* agents_callback sonucunun ozeti: kac agent satiri donmus, kacta elenmis,
+	 * dispatched mi, agent bulundu mu vs. */
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+		"[CCDSP] tick=%" SWITCH_TIME_T_FMT " MEMBER_AGENTS_CB_DONE session=%s queue=%s strategy=%s member=%s score=%s waited_s=%ld "
+		"dispatched=%s agent_found=%s rows=%d skip_tier=%d skip_state=%d skip_other_box=%d reserve_failed=%d lost_race=%d\n",
+		tick_id, cbt.member_session_uuid ? cbt.member_session_uuid : "-",
+		cbt.queue_name ? cbt.queue_name : "?", queue_strategy ? queue_strategy : "?",
+		cbt.member_uuid ? cbt.member_uuid : "?", cbt.member_score ? cbt.member_score : "?", waited_seconds,
+		cbt.dispatched ? "true" : "false", cbt.agent_found ? "true" : "false",
+		cbt.agents_total_rows, cbt.agents_skipped_tier, cbt.agents_skipped_state,
+		cbt.agents_skipped_other_box, cbt.agents_reserve_failed, cbt.agents_lost_race);
+
+	if (is_waiting_state) {
+		if (cbt.dispatched) {
+			if (tctx) tctx->members_dispatched++;
+		} else {
+			if (tctx) tctx->members_no_agent++;
+		}
+	}
+
+	/* Dispatch edilemediyse kuyrugu bu tur icin blokla; alt score'lular atlansin. */
+	if (is_waiting_state && blocked_queues && cbt.queue_name && !cbt.dispatched
+			&& !switch_core_hash_find(blocked_queues, cbt.queue_name)) {
+		switch_core_hash_insert(blocked_queues, cbt.queue_name, (void *) 1);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+			"[CCDSP] tick=%" SWITCH_TIME_T_FMT " QUEUE_LOCK session=%s queue=%s member=%s score=%s waited_s=%ld "
+			"reason=top_waiting_member_no_agent rows=%d (alt score'lular bu tur atlanacak)\n",
+			tick_id, cbt.member_session_uuid ? cbt.member_session_uuid : "-",
+			cbt.queue_name, cbt.member_uuid ? cbt.member_uuid : "?",
+			cbt.member_score ? cbt.member_score : "?", waited_seconds, cbt.agents_total_rows);
+	}
+
 	/* We update a field in the queue struct so we can kick caller out if waiting for too long with no agent */
 	if (!cbt.queue_name || !(queue = get_queue(cbt.queue_name))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Queue %s not found locally, skip this member\n", cbt.queue_name);
@@ -2776,16 +2940,67 @@ void *SWITCH_THREAD_FUNC cc_agent_dispatch_thread_run(switch_thread_t *thread, v
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "Agent Dispatch Thread Started\n");
 
-	while (globals.running == 1) {
-		char *sql = NULL;
-		sql = switch_mprintf("SELECT queue,uuid,session_uuid,cid_number,cid_name,joined_epoch,(%" SWITCH_TIME_T_FMT "-joined_epoch)+base_score+skill_score AS score, state, abandoned_epoch, serving_agent, instance_id FROM members"
-				" WHERE (state = '%q' OR state = '%q' OR (serving_agent = 'ring-all' AND state = '%q') OR (serving_agent = 'ring-progressively' AND state = '%q')) AND instance_id = '%q' ORDER BY score DESC",
-				local_epoch_time_now(NULL),
-				cc_member_state2str(CC_MEMBER_STATE_WAITING), cc_member_state2str(CC_MEMBER_STATE_ABANDONED), cc_member_state2str(CC_MEMBER_STATE_TRYING), cc_member_state2str(CC_MEMBER_STATE_TRYING), globals.cc_instance_id);
+	{
+		static switch_time_t s_tick_id = 0;
+		while (globals.running == 1) {
+			char *sql = NULL;
+			switch_time_t now = local_epoch_time_now(NULL);
+			switch_time_t tick_start_us = switch_micro_time_now();
+			dispatch_tick_ctx_t tctx;
+			switch_time_t tick_id = ++s_tick_id;
 
-		cc_execute_sql_callback(NULL /* queue */, NULL /* mutex */, sql, members_callback, NULL /* Call back variables */);
-		switch_safe_free(sql);
-		switch_yield(100000);
+			memset(&tctx, 0, sizeof(tctx));
+			tctx.tick_id = tick_id;
+
+			/*
+			 * Kuyruk-bazli strict oncelik + paralel dispatch.
+			 *
+			 * SELECT tum adaylari score DESC siralar. members_callback ayni
+			 * turda ayni kuyrukta *yuksek score'lu* bir Waiting member agent
+			 * bulamadiysa blocked_queues hash'ine kuyrugu ekler; sonraki gelen
+			 * dusuk score'lular o turda atlanir. Bu sayede:
+			 *   - Normal durum: kuyrukta bos N agent varsa N dispatch paralel
+			 *     olarak tek turda yapilir.
+			 *   - Yaris penceresi yok: en ust member bos agent bulamadiysa,
+			 *     turun ortasinda bosalan agent alt score'lu member'a gitmez;
+			 *     bir sonraki turda tekrar en yuksek score'lu member ilk
+			 *     sansi alir.
+			 */
+			switch_core_hash_init(&tctx.blocked_queues);
+
+			sql = switch_mprintf(
+					"SELECT queue,uuid,session_uuid,cid_number,cid_name,joined_epoch,"
+					"(%" SWITCH_TIME_T_FMT "-joined_epoch)+base_score+skill_score AS score,"
+					" state, abandoned_epoch, serving_agent, instance_id FROM members"
+					" WHERE (state = '%q' OR state = '%q'"
+					"        OR (serving_agent = 'ring-all' AND state = '%q')"
+					"        OR (serving_agent = 'ring-progressively' AND state = '%q'))"
+					"   AND instance_id = '%q'"
+					" ORDER BY score DESC",
+					now,
+					cc_member_state2str(CC_MEMBER_STATE_WAITING),
+					cc_member_state2str(CC_MEMBER_STATE_ABANDONED),
+					cc_member_state2str(CC_MEMBER_STATE_TRYING),
+					cc_member_state2str(CC_MEMBER_STATE_TRYING),
+					globals.cc_instance_id);
+
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+				"[CCDSP] tick=%" SWITCH_TIME_T_FMT " TICK_START now=%" SWITCH_TIME_T_FMT " instance=%s\n",
+				tick_id, now, globals.cc_instance_id ? globals.cc_instance_id : "?");
+
+			cc_execute_sql_callback(NULL /* queue */, NULL /* mutex */, sql, members_callback, &tctx);
+			switch_safe_free(sql);
+
+			/* Tick sonu ozeti: kac member goruldu, kac dispatch, kac kilit, sure */
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+				"[CCDSP] tick=%" SWITCH_TIME_T_FMT " TICK_END seen=%d dispatched=%d skipped_locked=%d no_agent=%d abandoned_path=%d duration_us=%" SWITCH_TIME_T_FMT "\n",
+				tick_id, tctx.members_seen, tctx.members_dispatched, tctx.members_skipped_blocked,
+				tctx.members_no_agent, tctx.members_abandoned,
+				switch_micro_time_now() - tick_start_us);
+
+			switch_core_hash_destroy(&tctx.blocked_queues);
+			switch_yield(100000);
+		}
 	}
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "Agent Dispatch Thread Ended\n");
